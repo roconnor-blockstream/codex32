@@ -20,37 +20,27 @@ import Codex32.Polynomial
 data AdvancedOptions = AdvancedOptions { optLength :: Int
                                        , optOverrideLength :: Bool
                                        , optErasures :: [Int]
-                                       , optSpec :: Spec
                                        , optResidue :: Poly Word5
                                        }
 
 data Command = Simple String
              | Advanced AdvancedOptions
 
-residueReader :: Opt.ReadM (Spec, [Word5])
-residueReader = do
-  result <- Opt.eitherReader parse
-  let len = length result
-  spec <- maybe (failLength len) return $ find (\spec -> len == specDegree spec) specs
-  return (spec, result)
+residueReader :: Opt.ReadM [Word5]
+residueReader = Opt.eitherReader parse
  where
   parse = (errMsg +++ reverse) . fromString
   errMsg c = "Illegal Bech32 character " ++ show c ++ "."
-  failLength len = fail $ "Residue length must be " ++ intercalate " or " (show <$> validDegrees) ++ "."
-  validDegrees = specDegree <$> specs
-  specs = [codex32Spec, codex32LongSpec]
 
 codex32SimpleParser :: Opt.Parser Command
 codex32SimpleParser = Simple <$> Opt.strArgument (Opt.metavar "CODEX32_STRING" <> Opt.help "Codex32 string to correct")
 
 codex32AdvancedParser :: Opt.Parser Command
 codex32AdvancedParser = Advanced <$>
-  (mkAdvancedOptions <$> Opt.option Opt.auto (Opt.long "len" <> Opt.metavar metaLength <> Opt.help "Total length of codex32 string")
-                     <*> Opt.switch (Opt.long overrideOptName <> Opt.hidden)
-                     <*> many (Opt.option Opt.auto (Opt.short 'e' <> Opt.metavar "ERASURE_LOCATION" <> Opt.help "Location of unreadable character (can be repeated)"))
-                     <*> Opt.argument residueReader (Opt.metavar metaResidue <> Opt.help "Residue from worksheet"))
- where
-  mkAdvancedOptions l ol e (s, r) = AdvancedOptions l ol e s r
+  (AdvancedOptions <$> Opt.option Opt.auto (Opt.long "len" <> Opt.metavar metaLength <> Opt.help "Total length of codex32 string")
+                   <*> Opt.switch (Opt.long overrideOptName <> Opt.hidden)
+                   <*> many (Opt.option Opt.auto (Opt.short 'e' <> Opt.metavar "ERASURE_LOCATION" <> Opt.help "Location of unreadable character (can be repeated)"))
+                   <*> Opt.argument residueReader (Opt.metavar metaResidue <> Opt.help "Residue from worksheet"))
 
 metaLength = "LENGTH"
 overrideOptName = "override_length"
@@ -85,7 +75,7 @@ formatCorrections :: Int -> [(Int, Word5)] -> String
 formatCorrections _ [] = "No errors found.  Residue is correct."
 formatCorrections len corrections = unlines (header : (fmt <$> corrections))
  where
-  header = show len ++ " errors found.  Make the following corrections."
+  header = show (length corrections) ++ " errors found.  Make the following corrections."
   fmt (ix, delta) = "Add " ++ show (toChar delta) ++ " to position " ++ show (len - ix) ++ "."
 
 main :: IO ()
@@ -96,24 +86,28 @@ run (Simple codex32Str) =
   case (correctCodex32String codex32Str) of
     Nothing -> putStrLn "Failed to error correct string" >> Sys.exitFailure
     Just str -> putStrLn str >> Sys.exitSuccess
-run (Advanced options) | 13 < length erasureIxs = failWith "No more than 13 -e options are allowed."
-                       | not (optOverrideLength options) && bitsize `notElem` [128, 256, 512] = failWith $ "Unusual bitsize found.  Override with --" ++ overrideOptName ++ "."
-                       | 5 <= padding = failWith $ "Invalid " ++ metaLength ++ "."
-                       | len < 48 = failWith $ metaLength ++ " too short."
-                       | 127 < len = failWith $ metaLength ++ " too long."
-                       | specDataLength spec < 6 + payloadLength = failWith $ metaLength ++ " too long for " ++ show (length residue) ++ " character " ++ metaResidue ++ "."
-                       | 15 == length residue && len < 99 = failWith $ metaLength ++ " too short for " ++ show (length residue) ++ " character " ++ metaResidue ++ "."
+run (Advanced options) | bitsize < 128 = failWith $ metaLength ++ " too short."
+                       | 512 < bitsize = failWith $ metaLength ++ " too long."
+                       | degree /= length residue = failWith $ metaResidue ++ " must be " ++ show degree ++ " characters for length " ++ show len ++ "."
+                       | not (optOverrideLength options) && bitsize `notElem` [128, 160, 192, 224, 256, 512] = failWith $ "Unusual bitsize found.  Override with --" ++ overrideOptName ++ "."
+                       | specLength spec < dataLength || 5 <= padding = failWith $ "Invalid " ++ metaLength ++ "."
+                       | degree < length erasureIxs = failWith $ "No more than "++ show degree ++ "-e options are allowed."
+                         -- erasureIxs are negated from the parsed values, so that is why these messages seem backwards, but they are not.
+                       | any (< 0) erasureIxs = failWith $ "Erasure locations cannot be greater than "++ show len ++"."
+                       | any (dataLength <=) erasureIxs = failWith $ "Erasure locations must be after the prefix."
                        | otherwise = format result
  where
-  erasureIxs = nub (optErasures options)
+  erasureIxs = (len -) <$> (nub (optErasures options))
   residue = optResidue options
   len = optLength options
-  spec = optSpec options
+  spec | 99 <= len = codex32LongSpec
+       | otherwise = codex32Spec
+  degree = specDegree spec
   dataLength = len - length (specPrefix spec) - 1
   payloadLength = dataLength - 6 - length (specTarget spec)
   (bytesize, padding) = (payloadLength * 5) `divMod` 8
   bitsize = bytesize * 8
   failWith str = Opt.handleParseResult . Opt.Failure $ Opt.parserFailure codex32Prefs codex32Options (Opt.ErrorMsg str) [Opt.Context "correct" codex32CorrectParser]
-  result = errorCorrections (optSpec options) erasureIxs residue
+  result = errorCorrections spec erasureIxs residue
   format Nothing = putStrLn "Too many errors.  Unable to correct." >> Sys.exitFailure
   format (Just corrections) = putStr (formatCorrections len corrections) >> Sys.exitSuccess
